@@ -201,6 +201,12 @@ template <typename T>
 T BoxOverlapBevExecutor::getIntersectionPoints(const PPoint<T> (&pts1)[4],
                                                const PPoint<T> (&pts2)[4],
                                                PPoint<T> (&intersections)[24]) {
+  // Robust on-edge tolerance, keep in sync with the MLU kernel fix for
+  // PYTORCH-29910: an intersection or a vertex landing exactly on the other
+  // box's edge must be classified as inside. float32 rounding (x86 cosf/sinf
+  // differ from the MLU cos/sin by a few ulps) would otherwise flip the
+  // strict boundary comparisons and randomly drop such vertices.
+  static constexpr T ON_EDGE_EPS = (T)1e-6;
   // Line vector, from p1 to p2 is: p1+(p2-p1)*t, t=[0,1]
   PPoint<T> vec1[4], vec2[4];
   for (int i = 0; i < 4; i++) {
@@ -214,8 +220,14 @@ T BoxOverlapBevExecutor::getIntersectionPoints(const PPoint<T> (&pts1)[4],
     for (int j = 0; j < 4; j++) {
       T det = cross2d<T>(vec2[j], vec1[i]);
 
-      // deal with parallel lines
-      if (fabs(det) <= 1e-14) {
+      // scale-aware parallel test (PYTORCH-29910): collinear / nearly
+      // parallel edges give det ~ 1e-7 of float32 noise, far above an
+      // absolute 1e-14 cutoff, and the t = noise/noise crossings then
+      // inject garbage points that break the convex hull. Keep in sync
+      // with the MLU kernel.
+      T n1 = sqrtf(dot2d<T>(vec1[i], vec1[i]));
+      T n2 = sqrtf(dot2d<T>(vec2[j], vec2[j]));
+      if (fabs(det) <= ON_EDGE_EPS * n1 * n2) {
         continue;
       }
 
@@ -224,7 +236,9 @@ T BoxOverlapBevExecutor::getIntersectionPoints(const PPoint<T> (&pts1)[4],
       T t1 = cross2d<T>(vec2[j], vec12) * (1.0f / det);
       T t2 = cross2d<T>(vec1[i], vec12) * (1.0f / det);
 
-      if (t1 >= 0.0f && t1 <= 1.0f && t2 >= 0.0f && t2 <= 1.0f) {
+      // bounds widened by ON_EDGE_EPS (PYTORCH-29910), t is dimensionless
+      if (t1 >= -ON_EDGE_EPS && t1 <= (T)1.0 + ON_EDGE_EPS &&
+          t2 >= -ON_EDGE_EPS && t2 <= (T)1.0 + ON_EDGE_EPS) {
         intersections[num++] = pts1[i] + vec1[i] * t1;
         VLOG(7) << "intersections %" << i * 4 + j << ": "
                 << intersections[num - 1].x << ", " << intersections[num - 1].y;
@@ -238,6 +252,8 @@ T BoxOverlapBevExecutor::getIntersectionPoints(const PPoint<T> (&pts1)[4],
     const auto &DA = vec2[3];
     auto ABdotAB = dot2d<T>(AB, AB);
     auto ADdotAD = dot2d<T>(DA, DA);
+    // scale-aware on-edge tolerance (PYTORCH-29910)
+    T tol = ON_EDGE_EPS * (ABdotAB + ADdotAD);
     for (int i = 0; i < 4; i++) {
       // assume ABCD is the rectangle, and P is the point to be judged
       // P is inside ABCD iff. P's projection on AB lines within AB
@@ -245,8 +261,8 @@ T BoxOverlapBevExecutor::getIntersectionPoints(const PPoint<T> (&pts1)[4],
       auto AP = pts1[i] - pts2[0];
       auto APdotAB = dot2d<T>(AP, AB);
       auto APdotAD = -dot2d<T>(AP, DA);
-      if ((APdotAB >= 0) && (APdotAD >= 0) && (APdotAB <= ABdotAB) &&
-          (APdotAD <= ADdotAD)) {
+      if ((APdotAB >= -tol) && (APdotAD >= -tol) &&
+          (APdotAB <= ABdotAB + tol) && (APdotAD <= ADdotAD + tol)) {
         intersections[num++] = pts1[i];
         VLOG(7) << "intersections %" << i + 16 << ": "
                 << intersections[num - 1].x << ", " << intersections[num - 1].y;
@@ -260,12 +276,14 @@ T BoxOverlapBevExecutor::getIntersectionPoints(const PPoint<T> (&pts1)[4],
     const auto &DA = vec1[3];
     auto ABdotAB = dot2d<T>(AB, AB);
     auto ADdotAD = dot2d<T>(DA, DA);
+    // scale-aware on-edge tolerance (PYTORCH-29910)
+    T tol = ON_EDGE_EPS * (ABdotAB + ADdotAD);
     for (int i = 0; i < 4; i++) {
       auto AP = pts2[i] - pts1[0];
       auto APdotAB = dot2d<T>(AP, AB);
       auto APdotAD = -dot2d<T>(AP, DA);
-      if ((APdotAB >= 0) && (APdotAD >= 0) && (APdotAB <= ABdotAB) &&
-          (APdotAD <= ADdotAD)) {
+      if ((APdotAB >= -tol) && (APdotAD >= -tol) &&
+          (APdotAB <= ABdotAB + tol) && (APdotAD <= ADdotAD + tol)) {
         intersections[num++] = pts2[i];
         VLOG(7) << "intersections %" << i + 20 << ": "
                 << intersections[num - 1].x << ", " << intersections[num - 1].y;

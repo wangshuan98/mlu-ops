@@ -29,6 +29,20 @@
 #define TABLE_LENGTH 64
 // each box data contains 5 number: x, y, w, h, a
 #define SINGLE_BOX_DIM 5
+// Robust on-edge tolerance (PYTORCH-29910): an intersection or a vertex
+// landing exactly on the other box's edge must be classified as inside.
+// In real arithmetic such inputs hit the exact-equality boundaries of the
+// t in [0,1] / dot-product tests, but float32 rounding noise (a few ulps)
+// randomly flips the strict comparisons and silently drops the corner,
+// underestimating the overlap area (e.g. 4.0 -> 2.0 / 0.0).
+// - line test: t is dimensionless, widen [0, 1] to [-EPS, 1 + EPS]
+// - inside test: projections are squared-length scaled, widen bounds by
+//   EPS * (ABdotAB + ADdotAD) and treat on-edge as inside
+// - parallel test: |det| is length-squared scaled, skip the line pair when
+//   |det| <= EPS * |vec1| * |vec2| (collinear edges give ~1e-7 of noise,
+//   far above the old absolute 1e-14 cutoff, and t = noise/noise then
+//   injects garbage points that break the convex hull)
+#define ON_EDGE_EPS 1e-6
 __nram__ int8_t nram_buffer[MAX_NRAM_SIZE];
 // cross2d<T>(A, B) = A.x * B.y - A.y * B.x;
 
@@ -129,7 +143,8 @@ __mlu_func__ void getIntersectionPoints(
     T *vec1_x, T *vec1_y, T *vec2_x, T *vec2_y, T *intersect_pts_x,
     T *intersect_pts_y, T *valid_pts, T *nums_in_ram, T *temp1_ram,
     T *temp2_ram, T *temp3_ram, T *temp4_ram, T *temp5_ram, T *temp6_ram,
-    T *temp7_ram, T *temp8_ram, const uint32_t &actual_compute_box_num) {
+    T *temp7_ram, T *temp8_ram, T *tol_ram,
+    const uint32_t &actual_compute_box_num) {
   // Line vector, from p1 to p2 is: p1+(p2-p1)*t, t=[0,1]
   // for i = 0~3, vec[i] = pts[(i+1)%4] - pts[i]
   __bang_sub((T *)vec1_x, (T *)rotated_pts1_x + actual_compute_box_num,
@@ -162,10 +177,38 @@ __mlu_func__ void getIntersectionPoints(
                  (T *)vec1_x + i * actual_compute_box_num,
                  (T *)vec1_y + i * actual_compute_box_num,
                  actual_compute_box_num, (T *)temp1_ram);
-      // deal with parallel lines, temp2 = fabs(det), temp1 = temp2 <= 1e-14
+      // deal with parallel lines (PYTORCH-29910): collinear / nearly
+      // parallel edges (e.g. boxes whose edges overlap) give det ~ 1e-7 of
+      // float32 noise, far above the old absolute 1e-14 cutoff, and the
+      // t = noise/noise crossings then inject garbage points that break the
+      // convex hull. Use a scale-aware cutoff: |det| <= eps * |vec1| * |vec2|
+      // (temp4 = eps * |vec1[i]| * |vec2[j]|, temp3 = fabs(det)),
+      // temp1 = (|det| > eps * |vec1| * |vec2|)
+      __bang_mul((T *)temp4_ram, (T *)vec1_x + i * actual_compute_box_num,
+                 (T *)vec1_x + i * actual_compute_box_num,
+                 actual_compute_box_num);
+      __bang_mul((T *)temp5_ram, (T *)vec1_y + i * actual_compute_box_num,
+                 (T *)vec1_y + i * actual_compute_box_num,
+                 actual_compute_box_num);
+      __bang_add((T *)temp4_ram, (T *)temp4_ram, (T *)temp5_ram,
+                 actual_compute_box_num);
+      __bang_sqrt((T *)temp4_ram, (T *)temp4_ram, actual_compute_box_num);
+      __bang_mul((T *)temp5_ram, (T *)vec2_x + j * actual_compute_box_num,
+                 (T *)vec2_x + j * actual_compute_box_num,
+                 actual_compute_box_num);
+      __bang_mul((T *)temp7_ram, (T *)vec2_y + j * actual_compute_box_num,
+                 (T *)vec2_y + j * actual_compute_box_num,
+                 actual_compute_box_num);
+      __bang_add((T *)temp5_ram, (T *)temp5_ram, (T *)temp7_ram,
+                 actual_compute_box_num);
+      __bang_sqrt((T *)temp5_ram, (T *)temp5_ram, actual_compute_box_num);
+      __bang_mul_scalar((T *)temp4_ram, (T *)temp4_ram, (T)ON_EDGE_EPS,
+                        actual_compute_box_num);
+      __bang_mul((T *)temp4_ram, (T *)temp4_ram, (T *)temp5_ram,
+                 actual_compute_box_num);
       __bang_abs((T *)temp3_ram, (T *)temp2_ram, actual_compute_box_num);
-      __bang_le_scalar((T *)temp1_ram, (T *)temp3_ram, (T)1e-14,
-                       actual_compute_box_num);
+      __bang_le((T *)temp1_ram, (T *)temp3_ram, (T *)temp4_ram,
+                actual_compute_box_num);
       __bang_not((T *)temp1_ram, (T *)temp1_ram, actual_compute_box_num);
       // auto vec12 = pts2[j] - pts1[i], (temp4, temp5) =
       // (vec12.x, vec12.y)
@@ -191,20 +234,23 @@ __mlu_func__ void getIntersectionPoints(
       __bang_div((T *)temp7_ram, (T *)temp7_ram, (T *)temp2_ram,
                  actual_compute_box_num);
       // temp1 &= (t1 >= 0.0f && t1 <= 1.0f)  -- temp7
-      __bang_ge_scalar((T *)temp5_ram, (T *)temp6_ram, (T)0,
+      // NOTE: bounds are widened to [-ON_EDGE_EPS, 1 + ON_EDGE_EPS] so an
+      // intersection landing exactly on a segment endpoint (vertex on the
+      // other box's edge) is not rejected by float32 rounding (PYTORCH-29910)
+      __bang_ge_scalar((T *)temp5_ram, (T *)temp6_ram, (T)-ON_EDGE_EPS,
                        actual_compute_box_num);
       __bang_and((T *)temp1_ram, (T *)temp1_ram, (T *)temp5_ram,
                  actual_compute_box_num);
-      __bang_le_scalar((T *)temp5_ram, (T *)temp6_ram, (T)1,
+      __bang_le_scalar((T *)temp5_ram, (T *)temp6_ram, (T)(1 + ON_EDGE_EPS),
                        actual_compute_box_num);
       __bang_and((T *)temp1_ram, (T *)temp1_ram, (T *)temp5_ram,
                  actual_compute_box_num);
       // temp1 &= (t2 >= 0.0f && t2 <= 1.0f)  -- temp7
-      __bang_ge_scalar((T *)temp5_ram, (T *)temp7_ram, (T)0,
+      __bang_ge_scalar((T *)temp5_ram, (T *)temp7_ram, (T)-ON_EDGE_EPS,
                        actual_compute_box_num);
       __bang_and((T *)temp1_ram, (T *)temp1_ram, (T *)temp5_ram,
                  actual_compute_box_num);
-      __bang_le_scalar((T *)temp5_ram, (T *)temp7_ram, (T)1,
+      __bang_le_scalar((T *)temp5_ram, (T *)temp7_ram, (T)(1 + ON_EDGE_EPS),
                        actual_compute_box_num);
       __bang_and((T *)temp1_ram, (T *)temp1_ram, (T *)temp5_ram,
                  actual_compute_box_num);
@@ -260,6 +306,22 @@ __mlu_func__ void getIntersectionPoints(
            (T *)vec2_x + 3 * actual_compute_box_num,
            (T *)vec2_y + 3 * actual_compute_box_num, actual_compute_box_num,
            (T *)temp7_ram);
+  // On-edge tolerance (PYTORCH-29910): a vertex of rect1 lying exactly on
+  // rect2's edge has APdotAB/APdotAD equal to the bounds in real arithmetic;
+  // float32 rounding flips the strict comparisons and drops the vertex.
+  // tol_ram[0, N) = tol = ON_EDGE_EPS * (ABdotAB + ADdotAD), scale-aware;
+  // tol_ram[N, 2N) = -tol. Widen the upper bounds by +tol and classify
+  // APdotAB/APdotAD >= -tol as inside, so on-edge vertices are kept.
+  __bang_add((T *)tol_ram, (T *)temp3_ram, (T *)temp4_ram,
+             actual_compute_box_num);
+  __bang_mul_scalar((T *)tol_ram, (T *)tol_ram, (T)ON_EDGE_EPS,
+                    actual_compute_box_num);
+  __bang_mul_scalar((T *)tol_ram + actual_compute_box_num, (T *)tol_ram, (T)-1,
+                    actual_compute_box_num);
+  __bang_add((T *)temp3_ram, (T *)temp3_ram, (T *)tol_ram,
+             actual_compute_box_num);
+  __bang_add((T *)temp4_ram, (T *)temp4_ram, (T *)tol_ram,
+             actual_compute_box_num);
   // assume ABCD is the rectangle, and P is the point to be judged
   // P is inside ABCD iff. P's projection on AB lines within AB
   // and P's projection on AD lies within AD
@@ -279,13 +341,12 @@ __mlu_func__ void getIntersectionPoints(
              (T *)temp2_ram);
     __bang_mul_scalar((T *)temp8_ram, (T *)temp8_ram, (T)-1,
                       actual_compute_box_num);
-    // ((APdotAB >= 0) && (APdotAD >= 0) && (APdotAB <=
-    // ABdotAB) && (APdotAD <=
-    // ADdotAD))
-    __bang_ge_scalar((T *)temp1_ram, (T *)temp7_ram, (T)0,
-                     actual_compute_box_num);
-    __bang_ge_scalar((T *)temp2_ram, (T *)temp8_ram, (T)0,
-                     actual_compute_box_num);
+    // ((APdotAB >= -tol) && (APdotAD >= -tol) && (APdotAB <= ABdotAB + tol) &&
+    // (APdotAD <= ADdotAD + tol)), on-edge counts as inside (PYTORCH-29910)
+    __bang_ge((T *)temp1_ram, (T *)temp7_ram,
+              (T *)tol_ram + actual_compute_box_num, actual_compute_box_num);
+    __bang_ge((T *)temp2_ram, (T *)temp8_ram,
+              (T *)tol_ram + actual_compute_box_num, actual_compute_box_num);
     __bang_and((T *)temp1_ram, (T *)temp1_ram, (T *)temp2_ram,
                actual_compute_box_num);
     __bang_le((T *)temp2_ram, (T *)temp7_ram, (T *)temp3_ram,
@@ -334,6 +395,18 @@ __mlu_func__ void getIntersectionPoints(
            (T *)vec1_x + 3 * actual_compute_box_num,
            (T *)vec1_y + 3 * actual_compute_box_num, actual_compute_box_num,
            (T *)temp7_ram);
+  // On-edge tolerance for the reverse check, same as above but scaled by
+  // rect1's edge lengths: tol_ram[0, N) = tol, tol_ram[N, 2N) = -tol
+  __bang_add((T *)tol_ram, (T *)temp3_ram, (T *)temp4_ram,
+             actual_compute_box_num);
+  __bang_mul_scalar((T *)tol_ram, (T *)tol_ram, (T)ON_EDGE_EPS,
+                    actual_compute_box_num);
+  __bang_mul_scalar((T *)tol_ram + actual_compute_box_num, (T *)tol_ram, (T)-1,
+                    actual_compute_box_num);
+  __bang_add((T *)temp3_ram, (T *)temp3_ram, (T *)tol_ram,
+             actual_compute_box_num);
+  __bang_add((T *)temp4_ram, (T *)temp4_ram, (T *)tol_ram,
+             actual_compute_box_num);
   for (int i = 0; i < 4; i++) {
     // AP = pts2[i] - pts1[0] = (temp5, temp6)
     __bang_sub((T *)temp5_ram, (T *)rotated_pts2_x + i * actual_compute_box_num,
@@ -350,13 +423,12 @@ __mlu_func__ void getIntersectionPoints(
              (T *)temp2_ram);
     __bang_mul_scalar((T *)temp8_ram, (T *)temp8_ram, (T)-1,
                       actual_compute_box_num);
-    // ((APdotAB >= 0) && (APdotAD >= 0) && (APdotAB <=
-    // ABdotAB) && (APdotAD <=
-    // ADdotAD))
-    __bang_ge_scalar((T *)temp1_ram, (T *)temp7_ram, (T)0,
-                     actual_compute_box_num);
-    __bang_ge_scalar((T *)temp2_ram, (T *)temp8_ram, (T)0,
-                     actual_compute_box_num);
+    // ((APdotAB >= -tol) && (APdotAD >= -tol) && (APdotAB <= ABdotAB + tol) &&
+    // (APdotAD <= ADdotAD + tol)), on-edge counts as inside (PYTORCH-29910)
+    __bang_ge((T *)temp1_ram, (T *)temp7_ram,
+              (T *)tol_ram + actual_compute_box_num, actual_compute_box_num);
+    __bang_ge((T *)temp2_ram, (T *)temp8_ram,
+              (T *)tol_ram + actual_compute_box_num, actual_compute_box_num);
     __bang_and((T *)temp1_ram, (T *)temp1_ram, (T *)temp2_ram,
                actual_compute_box_num);
     __bang_le((T *)temp2_ram, (T *)temp7_ram, (T *)temp3_ram,

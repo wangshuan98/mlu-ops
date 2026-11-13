@@ -322,13 +322,17 @@ __mlu_func__ void MLUUnion1BoxOverlapBevUtils(const T *box1, const T *box2,
         __bang_write_value((T *)nums_in_ram, actual_compute_box_num, (T)0);
 
         // 3. Get all intersection points
+        // NOTE: dist_ram is free during getIntersectionPoints (first written
+        // by convexHullGraham below), reuse its first 2xN elements as the
+        // on-edge tolerance scratch [tol | -tol]
         getIntersectionPoints(
             (T *)rotated_pts1_x, (T *)rotated_pts1_y, (T *)rotated_pts2_x,
             (T *)rotated_pts2_y, (T *)vec1_x, (T *)vec1_y, (T *)vec2_x,
             (T *)vec2_y, (T *)intersect_pts_x, (T *)intersect_pts_y,
             (T *)valid_pts, (T *)nums_in_ram, (T *)temp1_ram, (T *)temp2_ram,
             (T *)temp3_ram, (T *)temp4_ram, (T *)temp5_ram, (T *)temp6_ram,
-            (T *)temp7_ram, (T *)temp8_ram, actual_compute_box_num);
+            (T *)temp7_ram, (T *)temp8_ram, (T *)dist_ram,
+            actual_compute_box_num);
         // Where nums_in <= 2, set valid_box to false
         __bang_le_scalar((T *)temp1_ram, (T *)nums_in_ram, (T)2,
                          actual_compute_box_num);
